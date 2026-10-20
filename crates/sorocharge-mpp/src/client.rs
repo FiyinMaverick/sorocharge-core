@@ -406,10 +406,11 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
     use chrono::Duration as ChronoDuration;
+    use sorocharge_signer::SorochargeError;
     use std::time::Duration;
     use stellar_xdr::{AccountId, MuxedAccount, Preconditions, TransactionEnvelope, Uint256};
 
-    use crate::test_util::{MockResource, MockRpc, TestSigner};
+    use crate::test_util::{FailingSigner, MockResource, MockRpc, TestSigner};
     use crate::types::MethodDetails;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
     use base64::Engine as _;
@@ -473,6 +474,27 @@ mod tests {
         assert_eq!(v1.tx.fee, 0);
         // The sponsored path never needs the payer's account or a simulation.
         assert_eq!(rpc.methods(), vec!["getLatestLedger"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn payment_flow_returns_signing_error_when_signer_fails() {
+        let resource = MockResource::spawn(charge_request(true), Some(expires_in(300))).await;
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let address = TestSigner::from_seed([0x44; 32]).address();
+        let signing_error = SorochargeError::SigningFailed {
+            reason: "test signing failure".to_string(),
+        };
+        let signer = FailingSigner::new(address, signing_error.clone());
+
+        let result = client.get_with_payment(&resource.url, &signer, NETWORK).await;
+
+        assert!(
+            matches!(result, Err(MppError::Signing(ref error)) if error == &signing_error),
+            "expected Signing error, got {result:?}"
+        );
+        assert_eq!(resource.request_count(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
