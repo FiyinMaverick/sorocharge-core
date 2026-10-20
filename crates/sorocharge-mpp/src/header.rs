@@ -157,4 +157,33 @@ mod tests {
         assert_eq!(params.get("request").unwrap(), "eyJhbW91bnQiOiIxMDAwIn0");
         assert_eq!(params.get("expires").unwrap(), "2025-01-15T12:05:00Z");
     }
+
+    #[test]
+    fn decode_base64url_json_rejects_invalid_base64url() {
+        // Not valid base64url (contains invalid chars)
+        let result = decode_base64url_json::<serde_json::Value>("!!!invalid!!!");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("base64url decode failed"));
+    }
+
+    #[test]
+    fn decode_base64url_json_rejects_valid_base64url_but_invalid_json() {
+        // Valid base64url encoding of "not json"
+        let encoded = BASE64URL.encode(b"not json");
+        let result = decode_base64url_json::<serde_json::Value>(&encoded);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("JSON decode failed"));
+    }
+
+    #[test]
+    fn decode_base64url_json_rejects_valid_json_but_wrong_shape_for_charge_request() {
+        // Valid JSON but missing required fields for ChargeRequest
+        let encoded = BASE64URL.encode(br#"{"foo": "bar"}"#);
+        let result = decode_base64url_json::<crate::types::ChargeRequest>(&encoded);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("JSON decode failed"));
+    }
 }

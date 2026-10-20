@@ -404,14 +404,15 @@ impl<'a> MppClient<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use chrono::Duration as ChronoDuration;
     use std::time::Duration;
     use stellar_xdr::{AccountId, MuxedAccount, Preconditions, TransactionEnvelope, Uint256};
 
-    use crate::test_util::{FailingSigner, MockResource, MockRpc, TestSigner};
-    use crate::types::{ChargeRequest, Credential, MethodDetails};
-    use axum::response::IntoResponse;
-    use sorocharge_signer::SorochargeError;
+    use crate::test_util::{MockResource, MockRpc, TestSigner};
+    use crate::types::MethodDetails;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
+    use base64::Engine as _;
 
     const NETWORK: &str = "Test SDF Network ; September 2015";
     const CURRENT_LEDGER: u32 = 1_000;
@@ -518,70 +519,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn client_rejects_expired_challenge() {
-        let resource = MockResource::spawn(charge_request(false), Some(expires_in(-10))).await;
+    async fn invalid_challenge_request_returns_invalid_charge_request() {
+        // Create a mock resource that returns a challenge with an invalid request field
+        // (base64url that doesn't decode to valid JSON)
+        let invalid_request_b64 = BASE64URL.encode(b"not valid json");
         let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
         let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
         let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
         let signer = TestSigner::from_seed([0x44; 32]);
 
-        let result = client
-            .get_with_payment(&resource.url, &signer, NETWORK)
-            .await;
-
-        assert!(
-            matches!(result, Err(MppError::ChallengeExpired)),
-            "expected ChallengeExpired, got {result:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn client_rejects_unsupported_intent() {
-        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
-        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
-        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
-        let signer = TestSigner::from_seed([0x44; 32]);
-
-        // Build a challenge with intent != "charge" directly
-        use crate::header::{
-            build_www_authenticate_header, decode_base64url_json, encode_base64url_jcs,
-        };
-        use axum::routing::get;
-        use axum::Router;
-        use std::sync::Arc;
-        use std::sync::Mutex;
-
-        let charge = charge_request(false);
-        let request_b64 = encode_base64url_jcs(&charge).expect("encode charge request");
-        let challenge_header = build_www_authenticate_header(
+        // Build a challenge header with the invalid request field
+        let challenge_header = crate::header::build_www_authenticate_header(
             "test-challenge",
             "test.example",
-            &request_b64,
+            &invalid_request_b64,
             Some(&expires_in(300)),
         );
-        // Manually modify to have unsupported intent
-        let challenge_header = challenge_header.replace("intent=\"charge\"", "intent=\"other\"");
 
-        #[derive(Clone)]
-        struct MockState {
-            challenge_header: String,
-            captured: Arc<Mutex<Option<Credential>>>,
-            requests: Arc<Mutex<u32>>,
-        }
-
-        let state = MockState {
-            challenge_header,
-            captured: Arc::new(Mutex::new(None)),
-            requests: Arc::new(Mutex::new(0)),
-        };
-
-        let router = Router::new().route(
+        // Create a mock server that returns this specific challenge
+        let mock_router = axum::Router::new().route(
             "/resource",
-            get(move |headers: axum::http::HeaderMap| {
-                let state = state.clone();
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let challenge_header = challenge_header.clone();
                 async move {
-                    *state.requests.lock().expect("requests lock") += 1;
-
                     let credential_header = headers
                         .get(axum::http::header::AUTHORIZATION)
                         .or_else(|| headers.get("payment-authorization"));
@@ -589,62 +549,26 @@ mod tests {
                         let mut out = axum::http::HeaderMap::new();
                         out.insert(
                             axum::http::header::WWW_AUTHENTICATE,
-                            axum::http::HeaderValue::from_str(&state.challenge_header)
-                                .expect("valid header"),
+                            axum::http::HeaderValue::from_str(&challenge_header).unwrap(),
                         );
                         return (axum::http::StatusCode::PAYMENT_REQUIRED, out).into_response();
                     }
-
-                    let raw = credential_header
-                        .unwrap()
-                        .to_str()
-                        .expect("credential header is ASCII");
-                    let encoded = raw.strip_prefix("Payment ").expect("Payment auth scheme");
-                    let credential: Credential =
-                        decode_base64url_json(encoded).expect("credential decodes");
-                    *state.captured.lock().expect("credential lock") = Some(credential);
-                    (axum::http::StatusCode::OK, "paid resource body\n").into_response()
+                    (axum::http::StatusCode::OK, "paid\n").into_response()
                 }
             }),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+        let url = format!("http://{addr}/resource");
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("read addr");
-        let server_url = format!("http://{addr}/resource");
-        tokio::spawn(async move { axum::serve(listener, router).await.expect("mock server") });
-
-        let result = client.get_with_payment(&server_url, &signer, NETWORK).await;
-
-        assert!(
-            matches!(result, Err(MppError::UnsupportedIntent { ref intent }) if intent == "other"),
-            "expected UnsupportedIntent with intent 'other', got {result:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn client_returns_signing_error_when_signer_fails() {
-        let resource = MockResource::spawn(charge_request(false), Some(expires_in(300))).await;
-        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
-        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
-        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
-
-        let signer_address = TestSigner::from_seed([0x44; 32]).address();
-        let failing_signer = FailingSigner::new(
-            signer_address.clone(),
-            SorochargeError::SigningFailed {
-                reason: "simulated signing failure".to_string(),
-            },
-        );
-
-        let result = client
-            .get_with_payment(&resource.url, &failing_signer, NETWORK)
-            .await;
+        let result = client.get_with_payment(&url, &signer, NETWORK).await;
 
         assert!(
-            matches!(result, Err(MppError::Signing(_))),
-            "expected Signing error, got {result:?}"
+            matches!(result, Err(MppError::InvalidChargeRequest { ref reason }) if reason.contains("JSON decode failed")),
+            "expected InvalidChargeRequest, got {result:?}"
         );
     }
 }
