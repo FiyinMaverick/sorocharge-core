@@ -382,6 +382,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_source_account_credentials() {
+        let params = test_params();
+        // Build a valid entry with Legacy credentials, then replace with SourceAccount
+        // since CredentialKind doesn't include SourceAccount (it has no signature to build/verify)
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let mut auth_entry = unsigned.as_xdr().clone();
+        auth_entry.credentials = SorobanCredentials::SourceAccount;
+        let signed = SignedEntry::from_xdr(auth_entry);
+
+        let envelope = build_payment_transaction_envelope(&params, &signed).unwrap();
+        let result = parse_payment_transaction(&envelope);
+
+        assert!(matches!(result, Err(X402Error::ForbiddenCredentialType)));
+    }
+
+    #[test]
     fn parse_rejects_sub_invocations() {
         let params = test_params();
         let signer = TestSigner {

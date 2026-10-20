@@ -909,4 +909,38 @@ mod tests {
             "expected XdrDecodingFailed, got {result:?}"
         );
     }
+
+    #[tokio::test]
+    async fn settle_credential_rejects_unsupported_network() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        // Create an expected charge request with an unknown network
+        let mut expected = charge_request(false);
+        expected.method_details.network = "stellar:bogus".to_string();
+
+        // Create a credential that echoes this expected charge request
+        let credential = credential_for(
+            &expected,
+            Payload::Hash {
+                hash: "ab".repeat(32),
+            },
+        );
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::UnsupportedNetwork { ref network }) if network == "stellar:bogus"),
+            "expected UnsupportedNetwork, got {result:?}"
+        );
+    }
 }

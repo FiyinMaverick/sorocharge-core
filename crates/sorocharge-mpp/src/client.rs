@@ -779,4 +779,108 @@ mod tests {
             "expected UnsupportedMethod with method 'example', got {result:?}"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_request_failed_returns_error() {
+        // Test that an unreachable URL returns HttpRequestFailed
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(1)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        // Use an unreachable URL (port 1 is typically reserved/unreachable)
+        let url = "http://127.0.0.1:1/resource";
+        let result = client.get_with_payment(url, &signer, NETWORK).await;
+
+        assert!(
+            matches!(result, Err(MppError::HttpRequestFailed { ref reason }) if reason.contains("request attempt")),
+            "expected HttpRequestFailed, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_network_from_passphrase_returns_error() {
+        // Test that an unknown network passphrase returns UnsupportedNetwork
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        let resource = MockResource::spawn(charge_request(true), Some(expires_in(300))).await;
+
+        // Use an unknown network passphrase
+        let result = client
+            .get_with_payment(&resource.url, &signer, "Unknown Network ; January 2025")
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::UnsupportedNetwork { ref network }) if network == "Unknown Network ; January 2025"),
+            "expected UnsupportedNetwork, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_network_from_challenge_returns_error() {
+        // Test that a challenge with an unknown network returns UnsupportedNetwork
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        // Build a challenge with an unknown network using the same helper as the crate
+        let unknown_network = "stellar:bogus";
+        let charge_request = crate::types::ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH".to_string(),
+            recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N".to_string(),
+            description: None,
+            external_id: None,
+            method_details: crate::types::MethodDetails {
+                network: unknown_network.to_string(),
+                fee_payer: false,
+            },
+        };
+        let request_b64 = crate::header::encode_base64url_jcs(&charge_request).unwrap();
+        let challenge_header = crate::header::build_www_authenticate_header(
+            "test-challenge",
+            "test.example",
+            &request_b64,
+            Some(&expires_in(300)),
+        );
+
+        // Create a mock server that returns this challenge
+        let mock_router = axum::Router::new().route(
+            "/resource",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let challenge_header = challenge_header.clone();
+                async move {
+                    let credential_header = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .or_else(|| headers.get("payment-authorization"));
+                    if credential_header.is_none() {
+                        let mut out = axum::http::HeaderMap::new();
+                        out.insert(
+                            axum::http::header::WWW_AUTHENTICATE,
+                            axum::http::HeaderValue::from_str(&challenge_header).unwrap(),
+                        );
+                        return (axum::http::StatusCode::PAYMENT_REQUIRED, out).into_response();
+                    }
+                    (axum::http::StatusCode::OK, "paid\n").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+        let url = format!("http://{addr}/resource");
+
+        let result = client.get_with_payment(&url, &signer, NETWORK).await;
+
+        assert!(
+            matches!(result, Err(MppError::UnsupportedNetwork { ref network }) if network == unknown_network),
+            "expected UnsupportedNetwork with network '{unknown_network}', got {result:?}"
+        );
+    }
 }
