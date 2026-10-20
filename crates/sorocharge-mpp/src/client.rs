@@ -595,4 +595,188 @@ mod tests {
             "expected InvalidChargeRequest, got {result:?}"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_status_returns_error() {
+        // Test that a response with status other than 200 or 402 returns UnexpectedStatus
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        // Create a mock server that returns 404 Not Found
+        let mock_router = axum::Router::new().route(
+            "/resource",
+            axum::routing::get(|| async { (axum::http::StatusCode::NOT_FOUND, "not found") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+        let url = format!("http://{addr}/resource");
+
+        let result = client.get_with_payment(&url, &signer, NETWORK).await;
+
+        assert!(
+            matches!(result, Err(MppError::UnexpectedStatus { status }) if status == 404),
+            "expected UnexpectedStatus with status 404, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_challenge_header_returns_error() {
+        // Test that a 402 response with no WWW-Authenticate header returns MissingChallenge
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        // Create a mock server that returns 402 without WWW-Authenticate header
+        let mock_router = axum::Router::new().route(
+            "/resource",
+            axum::routing::get(|| async {
+                (axum::http::StatusCode::PAYMENT_REQUIRED, "payment required")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+        let url = format!("http://{addr}/resource");
+
+        let result = client.get_with_payment(&url, &signer, NETWORK).await;
+
+        assert!(
+            matches!(result, Err(MppError::MissingChallenge)),
+            "expected MissingChallenge, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_challenge_missing_required_field_returns_error() {
+        // Test that a challenge missing a required field (e.g., "method") returns InvalidChallenge
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        // Build a challenge header missing the "method" field
+        let request_b64 = BASE64URL.encode(
+            crate::header::encode_base64url_jcs(&crate::types::ChargeRequest {
+                amount: "1000000".to_string(),
+                currency: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH".to_string(),
+                recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N".to_string(),
+                description: None,
+                external_id: None,
+                method_details: crate::types::MethodDetails {
+                    network: "stellar:testnet".to_string(),
+                    fee_payer: false,
+                },
+            })
+            .unwrap(),
+        );
+        let challenge_header = format!(
+            "Payment id=\"test-challenge\", realm=\"test.example\", intent=\"charge\", request=\"{request_b64}\""
+        );
+
+        // Create a mock server that returns this malformed challenge
+        let mock_router = axum::Router::new().route(
+            "/resource",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let challenge_header = challenge_header.clone();
+                async move {
+                    let credential_header = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .or_else(|| headers.get("payment-authorization"));
+                    if credential_header.is_none() {
+                        let mut out = axum::http::HeaderMap::new();
+                        out.insert(
+                            axum::http::header::WWW_AUTHENTICATE,
+                            axum::http::HeaderValue::from_str(&challenge_header).unwrap(),
+                        );
+                        return (axum::http::StatusCode::PAYMENT_REQUIRED, out).into_response();
+                    }
+                    (axum::http::StatusCode::OK, "paid\n").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+        let url = format!("http://{addr}/resource");
+
+        let result = client.get_with_payment(&url, &signer, NETWORK).await;
+
+        assert!(
+            matches!(result, Err(MppError::InvalidChallenge { ref reason }) if reason.contains("missing \"method\"")),
+            "expected InvalidChallenge with missing method, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_method_returns_error() {
+        // Test that a challenge with method != "stellar" returns UnsupportedMethod
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        // Build a challenge header with method="example" (not "stellar")
+        let request_b64 = BASE64URL.encode(
+            crate::header::encode_base64url_jcs(&crate::types::ChargeRequest {
+                amount: "1000000".to_string(),
+                currency: "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH".to_string(),
+                recipient: "GCQJVJPUPJTVTABP7FK7RXBNFIKKLSM5EO7JP6DECJ77SOBUKWSPB64N".to_string(),
+                description: None,
+                external_id: None,
+                method_details: crate::types::MethodDetails {
+                    network: "stellar:testnet".to_string(),
+                    fee_payer: false,
+                },
+            })
+            .unwrap(),
+        );
+        let challenge_header = format!(
+            "Payment id=\"test-challenge\", realm=\"test.example\", method=\"example\", intent=\"charge\", request=\"{request_b64}\""
+        );
+
+        // Create a mock server that returns this challenge
+        let mock_router = axum::Router::new().route(
+            "/resource",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let challenge_header = challenge_header.clone();
+                async move {
+                    let credential_header = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .or_else(|| headers.get("payment-authorization"));
+                    if credential_header.is_none() {
+                        let mut out = axum::http::HeaderMap::new();
+                        out.insert(
+                            axum::http::header::WWW_AUTHENTICATE,
+                            axum::http::HeaderValue::from_str(&challenge_header).unwrap(),
+                        );
+                        return (axum::http::StatusCode::PAYMENT_REQUIRED, out).into_response();
+                    }
+                    (axum::http::StatusCode::OK, "paid\n").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+        let url = format!("http://{addr}/resource");
+
+        let result = client.get_with_payment(&url, &signer, NETWORK).await;
+
+        assert!(
+            matches!(result, Err(MppError::UnsupportedMethod { ref method }) if method == "example"),
+            "expected UnsupportedMethod with method 'example', got {result:?}"
+        );
+    }
 }
