@@ -404,12 +404,15 @@ impl<'a> MppClient<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use chrono::Duration as ChronoDuration;
     use std::time::Duration;
     use stellar_xdr::{AccountId, MuxedAccount, Preconditions, TransactionEnvelope, Uint256};
 
     use crate::test_util::{MockResource, MockRpc, TestSigner};
     use crate::types::MethodDetails;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
+    use base64::Engine as _;
 
     const NETWORK: &str = "Test SDF Network ; September 2015";
     const CURRENT_LEDGER: u32 = 1_000;
@@ -512,6 +515,60 @@ mod tests {
         assert_eq!(
             rpc.methods(),
             vec!["getLatestLedger", "getLedgerEntries", "simulateTransaction"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_challenge_request_returns_invalid_charge_request() {
+        // Create a mock resource that returns a challenge with an invalid request field
+        // (base64url that doesn't decode to valid JSON)
+        let invalid_request_b64 = BASE64URL.encode(b"not valid json");
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let client = MppClient::new(&rpc_client, Duration::from_secs(5)).expect("client");
+        let signer = TestSigner::from_seed([0x44; 32]);
+
+        // Build a challenge header with the invalid request field
+        let challenge_header = crate::header::build_www_authenticate_header(
+            "test-challenge",
+            "test.example",
+            &invalid_request_b64,
+            Some(&expires_in(300)),
+        );
+
+        // Create a mock server that returns this specific challenge
+        let mock_router = axum::Router::new().route(
+            "/resource",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let challenge_header = challenge_header.clone();
+                async move {
+                    let credential_header = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .or_else(|| headers.get("payment-authorization"));
+                    if credential_header.is_none() {
+                        let mut out = axum::http::HeaderMap::new();
+                        out.insert(
+                            axum::http::header::WWW_AUTHENTICATE,
+                            axum::http::HeaderValue::from_str(&challenge_header).unwrap(),
+                        );
+                        return (axum::http::StatusCode::PAYMENT_REQUIRED, out).into_response();
+                    }
+                    (axum::http::StatusCode::OK, "paid\n").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+        let url = format!("http://{addr}/resource");
+
+        let result = client.get_with_payment(&url, &signer, NETWORK).await;
+
+        assert!(
+            matches!(result, Err(MppError::InvalidChargeRequest { ref reason }) if reason.contains("JSON decode failed")),
+            "expected InvalidChargeRequest, got {result:?}"
         );
     }
 }

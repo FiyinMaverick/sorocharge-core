@@ -133,6 +133,7 @@ pub(crate) fn build_unsponsored_transaction(
 /// `pub` only so the `fuzzing`-gated re-export in `lib.rs` can name it; the
 /// enclosing `tx` module is private, so this is not part of the crate's
 /// normal public surface.
+#[derive(Debug)]
 pub struct TransferArgs {
     pub asset_contract: Address,
     pub from: Address,
@@ -354,5 +355,318 @@ mod tests {
         let result = parse_payment_transaction(&envelope);
 
         assert!(matches!(result, Err(MppError::ForbiddenCredentialType)));
+    }
+
+    #[test]
+    fn parse_rejects_wrong_number_of_operations() {
+        let params = test_params();
+        let signer = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015").unwrap();
+
+        // Build an envelope with zero operations
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        v1.tx.operations = vec![].try_into().unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("exactly one operation")),
+            "expected UnexpectedTransactionShape for zero operations, got {result:?}"
+        );
+
+        // Build an envelope with two operations
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        let op = v1.tx.operations[0].clone();
+        v1.tx.operations = vec![op.clone(), op].try_into().unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("exactly one operation")),
+            "expected UnexpectedTransactionShape for two operations, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_non_invoke_host_function_operation() {
+        let params = test_params();
+        let signer = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015").unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        // Replace the invokeHostFunction operation with a payment operation
+        v1.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::Payment(stellar_xdr::PaymentOp {
+                destination: stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256([3u8; 32])),
+                asset: stellar_xdr::Asset::Native,
+                amount: 100,
+            }),
+        }]
+        .try_into()
+        .unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("invokeHostFunction")),
+            "expected UnexpectedTransactionShape for non-invokeHostFunction op, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_function_name() {
+        let params = test_params();
+        let signer = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015").unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        // Change the function name from "transfer" to "something_else"
+        let mut invoke_op = match &v1.tx.operations[0].body {
+            stellar_xdr::OperationBody::InvokeHostFunction(op) => op.clone(),
+            _ => panic!(),
+        };
+        let stellar_xdr::HostFunction::InvokeContract(ref mut args) = invoke_op.host_function
+        else {
+            panic!()
+        };
+        args.function_name = "something_else".try_into().unwrap();
+        v1.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::InvokeHostFunction(invoke_op),
+        }]
+        .try_into()
+        .unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("function \"transfer\"")),
+            "expected UnexpectedTransactionShape for wrong function name, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_number_of_args() {
+        let params = test_params();
+        let signer = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015").unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        // Change to 2 args instead of 3
+        let mut invoke_op = match &v1.tx.operations[0].body {
+            stellar_xdr::OperationBody::InvokeHostFunction(op) => op.clone(),
+            _ => panic!(),
+        };
+        let stellar_xdr::HostFunction::InvokeContract(ref mut args) = invoke_op.host_function
+        else {
+            panic!()
+        };
+        args.args = vec![
+            stellar_xdr::ScVal::Address(params.payer.clone()),
+            stellar_xdr::ScVal::Address(params.recipient.clone()),
+        ]
+        .try_into()
+        .unwrap();
+        v1.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::InvokeHostFunction(invoke_op),
+        }]
+        .try_into()
+        .unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("expected exactly 3 args")),
+            "expected UnexpectedTransactionShape for wrong number of args, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_arg_types() {
+        let params = test_params();
+        let signer = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015").unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        // Change arg types: use U128 instead of Address for first arg
+        let mut invoke_op = match &v1.tx.operations[0].body {
+            stellar_xdr::OperationBody::InvokeHostFunction(op) => op.clone(),
+            _ => panic!(),
+        };
+        let stellar_xdr::HostFunction::InvokeContract(ref mut args) = invoke_op.host_function
+        else {
+            panic!()
+        };
+        args.args = vec![
+            stellar_xdr::ScVal::U128(stellar_xdr::UInt128Parts { hi: 0, lo: 0 }),
+            stellar_xdr::ScVal::Address(params.recipient.clone()),
+            stellar_xdr::ScVal::I128(stellar_xdr::Int128Parts {
+                hi: 0,
+                lo: 42_000_000,
+            }),
+        ]
+        .try_into()
+        .unwrap();
+        v1.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::InvokeHostFunction(invoke_op),
+        }]
+        .try_into()
+        .unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("expected exactly 3 args: address, address, i128")),
+            "expected UnexpectedTransactionShape for wrong arg types, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_multiple_auth_entries() {
+        let params = test_params();
+        let signer = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015").unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        // Add a second auth entry
+        let mut invoke_op = match &v1.tx.operations[0].body {
+            stellar_xdr::OperationBody::InvokeHostFunction(op) => op.clone(),
+            _ => panic!(),
+        };
+        invoke_op.auth = vec![invoke_op.auth[0].clone(), invoke_op.auth[0].clone()]
+            .try_into()
+            .unwrap();
+        v1.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::InvokeHostFunction(invoke_op),
+        }]
+        .try_into()
+        .unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("exactly one authorization entry")),
+            "expected UnexpectedTransactionShape for multiple auth entries, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_auth_entry_with_sub_invocations() {
+        let params = test_params();
+        let signer = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015").unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        // Add a sub-invocation to the auth entry
+        let mut invoke_op = match &v1.tx.operations[0].body {
+            stellar_xdr::OperationBody::InvokeHostFunction(op) => op.clone(),
+            _ => panic!(),
+        };
+        let mut auth_entry = invoke_op.auth[0].clone();
+        auth_entry.root_invocation.sub_invocations =
+            vec![auth_entry.root_invocation.clone()].try_into().unwrap();
+        invoke_op.auth = vec![auth_entry].try_into().unwrap();
+        v1.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::InvokeHostFunction(invoke_op),
+        }]
+        .try_into()
+        .unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("sub-invocations")),
+            "expected UnexpectedTransactionShape for auth entry with sub-invocations, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_auth_entry_invocation_mismatch() {
+        let params = test_params();
+        let signer = TestSigner {
+            signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+            address: params.payer.clone(),
+        };
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(unsigned, &signer, "Test SDF Network ; September 2015").unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let TransactionEnvelope::Tx(mut v1) = envelope else {
+            panic!()
+        };
+        // Change the auth entry's function to not match the operation
+        let mut invoke_op = match &v1.tx.operations[0].body {
+            stellar_xdr::OperationBody::InvokeHostFunction(op) => op.clone(),
+            _ => panic!(),
+        };
+        let mut auth_entry = invoke_op.auth[0].clone();
+        auth_entry.root_invocation.function =
+            stellar_xdr::SorobanAuthorizedFunction::ContractFn(stellar_xdr::InvokeContractArgs {
+                contract_address: params.asset_contract.clone(),
+                function_name: "other_func".try_into().unwrap(),
+                args: vec![].try_into().unwrap(),
+            });
+        invoke_op.auth = vec![auth_entry].try_into().unwrap();
+        v1.tx.operations = vec![stellar_xdr::Operation {
+            source_account: None,
+            body: stellar_xdr::OperationBody::InvokeHostFunction(invoke_op),
+        }]
+        .try_into()
+        .unwrap();
+        let envelope = TransactionEnvelope::Tx(v1);
+        let result = parse_payment_transaction(&envelope);
+        assert!(
+            matches!(result, Err(MppError::UnexpectedTransactionShape { ref reason }) if reason.contains("authorization entry's invocation does not match")),
+            "expected UnexpectedTransactionShape for auth entry invocation mismatch, got {result:?}"
+        );
     }
 }

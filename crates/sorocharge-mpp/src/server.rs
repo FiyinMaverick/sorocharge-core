@@ -517,6 +517,7 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use chrono::Duration as ChronoDuration;
     use sorocharge_signer::{build_charge_entry, sign_entry, CredentialKind};
     use stellar_xdr::{
@@ -748,5 +749,100 @@ mod tests {
             }
             other => panic!("expected a timeBounds rejection, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn push_mode_invalid_hash_returns_invalid_credential() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        let expected = charge_request(false);
+        // Invalid hash: not 64 hex chars
+        let credential = credential_for(
+            &expected,
+            Payload::Hash {
+                hash: "not-a-valid-hash".to_string(),
+            },
+        );
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::InvalidCredential { ref reason }) if reason.contains("invalid transaction hash")),
+            "expected InvalidCredential, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_mode_invalid_transaction_xdr_returns_xdr_decoding_failed() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        let expected = charge_request(false);
+        // Invalid XDR: not valid base64
+        let credential = credential_for(
+            &expected,
+            Payload::Transaction {
+                transaction: "!!!not-valid-base64!!!".to_string(),
+            },
+        );
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::XdrDecodingFailed { ref reason }) if reason.contains("Invalid symbol")),
+            "expected XdrDecodingFailed, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_mode_valid_base64_but_invalid_xdr_structure_returns_xdr_decoding_failed() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        let expected = charge_request(false);
+        // Valid base64 but not a valid TransactionEnvelope XDR
+        let invalid_xdr =
+            base64::engine::general_purpose::STANDARD.encode(b"not a valid xdr envelope");
+        let credential = credential_for(
+            &expected,
+            Payload::Transaction {
+                transaction: invalid_xdr,
+            },
+        );
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::XdrDecodingFailed { .. })),
+            "expected XdrDecodingFailed, got {result:?}"
+        );
     }
 }
