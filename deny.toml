@@ -1,5 +1,9 @@
 # deny.toml — cargo-deny configuration for vulnerability and license scanning
 
+[graph]
+# CI builds this workspace on Linux; add targets here when CI support expands.
+targets = ["x86_64-unknown-linux-gnu"]
+
 [advisories]
 version = 2
 
