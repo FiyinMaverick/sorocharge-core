@@ -355,4 +355,89 @@ mod tests {
 
         assert!(matches!(result, Err(MppError::ForbiddenCredentialType)));
     }
+
+    #[test]
+    fn sign_transaction_returns_signing_error_when_signer_fails() {
+        let params = test_params();
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(
+            unsigned,
+            &TestSigner {
+                signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+                address: params.payer.clone(),
+            },
+            "Test SDF Network ; September 2015",
+        )
+        .unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let (_, tx, _) = parse_payment_transaction(&envelope).unwrap();
+
+        struct FailingSigner {
+            address: Address,
+        }
+        impl Signer for FailingSigner {
+            fn sign_preimage(&self, _preimage: &[u8]) -> Result<[u8; 64], SorochargeError> {
+                Err(SorochargeError::SigningFailed {
+                    reason: "simulated failure".to_string(),
+                })
+            }
+            fn address(&self) -> Address {
+                self.address.clone()
+            }
+        }
+
+        let failing_signer = FailingSigner {
+            address: params.payer.clone(),
+        };
+        let network_id = [0u8; 32];
+        let result = sign_transaction(tx, &failing_signer, network_id);
+
+        assert!(matches!(result, Err(MppError::Signing(_))));
+    }
+
+    #[test]
+    fn sign_transaction_returns_xdr_encoding_failed_for_non_account_signer() {
+        let params = test_params();
+        let unsigned = build_charge_entry(&params, CredentialKind::Legacy).unwrap();
+        let signed = sign_entry(
+            unsigned,
+            &TestSigner {
+                signing_key: SigningKey::from_bytes(&[0x11u8; 32]),
+                address: params.payer.clone(),
+            },
+            "Test SDF Network ; September 2015",
+        )
+        .unwrap();
+
+        let envelope = build_sponsored_envelope(&params, &signed).unwrap();
+        let (_, tx, _) = parse_payment_transaction(&envelope).unwrap();
+
+        // Create a signer with a contract address (not an account)
+        let contract_address = "CAZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGMZTGGJH"
+            .parse::<Address>()
+            .expect("contract address");
+
+        struct ContractSigner {
+            address: Address,
+        }
+        impl Signer for ContractSigner {
+            fn sign_preimage(&self, _preimage: &[u8]) -> Result<[u8; 64], SorochargeError> {
+                Ok([0u8; 64])
+            }
+            fn address(&self) -> Address {
+                self.address.clone()
+            }
+        }
+
+        let contract_signer = ContractSigner {
+            address: contract_address,
+        };
+        let network_id = [0u8; 32];
+        let result = sign_transaction(tx, &contract_signer, network_id);
+
+        assert!(
+            matches!(result, Err(MppError::XdrEncodingFailed { ref reason }) if reason.contains("signer must be an Ed25519 account"))
+        );
+    }
 }

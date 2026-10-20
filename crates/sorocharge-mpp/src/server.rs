@@ -692,6 +692,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn settle_credential_rejects_expired_challenge() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        let expected = charge_request(false);
+        let mut credential = credential_for(
+            &expected,
+            Payload::Hash {
+                hash: "ef".repeat(32),
+            },
+        );
+        // Set expires to a timestamp in the past
+        credential.challenge.expires =
+            Some((Utc::now() - ChronoDuration::seconds(10)).to_rfc3339());
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::ChallengeExpired)),
+            "expected ChallengeExpired, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_credential_rejects_unsupported_intent() {
+        let rpc = MockRpc::spawn(CURRENT_LEDGER, ACCOUNT_SEQ_NUM).await;
+        let rpc_client = stellar_rpc_client::Client::new(&rpc.url).expect("rpc client");
+        let server_signer = TestSigner::from_seed([0x22; 32]);
+
+        let expected = charge_request(false);
+        let mut credential = credential_for(
+            &expected,
+            Payload::Hash {
+                hash: "ab".repeat(32),
+            },
+        );
+        credential.challenge.intent = "other".to_string();
+
+        let server = MppServer::new(
+            &rpc_client,
+            &server_signer,
+            NETWORK_PASSPHRASE.to_string(),
+            MppServerConfig::default(),
+        );
+        let result = server
+            .settle_credential(&credential, &expected, Utc::now(), false)
+            .await;
+
+        assert!(
+            matches!(result, Err(MppError::UnsupportedIntent { ref intent }) if intent == "other"),
+            "expected UnsupportedIntent with intent 'other', got {result:?}"
+        );
+    }
+
     /// Regression test for the sibling fix: with no `expires` on the
     /// challenge, an unsponsored transaction whose `maxTime` exceeds the
     /// server's default 5-minute expiry window must be rejected rather than

@@ -57,6 +57,28 @@ impl Signer for TestSigner {
     }
 }
 
+/// A signer that always fails to sign, used for testing error paths.
+pub(crate) struct FailingSigner {
+    address: Address,
+    error: SorochargeError,
+}
+
+impl FailingSigner {
+    pub(crate) fn new(address: Address, error: SorochargeError) -> Self {
+        Self { address, error }
+    }
+}
+
+impl Signer for FailingSigner {
+    fn sign_preimage(&self, _preimage: &[u8]) -> Result<[u8; 64], SorochargeError> {
+        Err(self.error.clone())
+    }
+
+    fn address(&self) -> Address {
+        self.address.clone()
+    }
+}
+
 /// Serves `router` on an ephemeral localhost port; returns its base URL with
 /// a trailing slash.
 async fn serve(router: Router) -> String {
@@ -82,6 +104,7 @@ pub(crate) struct MockRpcState {
     account_seq_num: i64,
     min_resource_fee: u64,
     methods: Mutex<Vec<String>>,
+    simulation_events: Mutex<Option<Vec<String>>>,
 }
 
 impl MockRpc {
@@ -93,12 +116,24 @@ impl MockRpc {
             account_seq_num,
             min_resource_fee: 100,
             methods: Mutex::new(Vec::new()),
+            simulation_events: Mutex::new(None),
         });
         let router = Router::new()
             .route("/", post(handle_rpc))
             .with_state(state.clone());
         let url = serve(router).await;
         Self { url, state }
+    }
+
+    /// Sets custom simulation events for the next `simulateTransaction` call.
+    /// The events should be base64-encoded XDR DiagnosticEvent structures.
+    #[allow(dead_code)]
+    pub(crate) fn set_simulation_events(&self, events: Vec<String>) {
+        *self
+            .state
+            .simulation_events
+            .lock()
+            .expect("simulation events lock") = Some(events);
     }
 
     /// The JSON-RPC methods the client called, in order.
@@ -150,10 +185,17 @@ async fn handle_rpc(
             let transaction_data = SorobanTransactionData::default()
                 .to_xdr_base64(Limits::none())
                 .expect("encode transaction data");
+            let events = state
+                .simulation_events
+                .lock()
+                .expect("simulation events lock")
+                .take()
+                .unwrap_or_default();
             json!({
                 "minResourceFee": state.min_resource_fee.to_string(),
                 "transactionData": transaction_data,
                 "latestLedger": state.latest_ledger,
+                "events": events,
             })
         }
         other => json!({
