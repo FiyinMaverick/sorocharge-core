@@ -488,7 +488,9 @@ mod tests {
         };
         let signer = FailingSigner::new(address, signing_error.clone());
 
-        let result = client.get_with_payment(&resource.url, &signer, NETWORK).await;
+        let result = client
+            .get_with_payment(&resource.url, &signer, NETWORK)
+            .await;
 
         assert!(
             matches!(result, Err(MppError::Signing(ref error)) if error == &signing_error),
